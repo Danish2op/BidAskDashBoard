@@ -1,0 +1,1494 @@
+"""
+NIFTY Options — Depth / Order Book Analyzer v2
+------------------------------------------------
+Adds: IQR stats, sweep slippage (first vs last price),
+weighted avg slippage, and redesigned dashboard.
+"""
+
+import os, json, re, math, glob, threading, webbrowser, http.server, socketserver
+import pandas as pd
+import numpy as np
+
+# ─────────────────────────────────────────
+# USER CONFIG
+# ─────────────────────────────────────────
+FOLDER = "/Users/urmila/fo_2026-05-27"
+LOT_SIZE = 65
+ORDER_LOTS = 100
+PORT = 8766
+DOWNSAMPLE = 20
+KEY_DEPTHS = [1, 2, 3, 4, 5, 10, 15, 20, 30]
+# ─────────────────────────────────────────
+
+try:
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+SCRIPT_DIR = os.getcwd()
+
+OUTPUT_JSON = os.path.join(SCRIPT_DIR, "depth_results.json")
+OUTPUT_HTML = os.path.join(SCRIPT_DIR, "depth_dashboard.html")
+
+FILE_RE = re.compile(
+r"(\d{4}-\d{2}-\d{2})_NIFTY_(\d+)_(CE|PE)_(.+?)_NSE_FO_(\d+)_depth_levels\.csv"
+)
+
+# ── ATM ────────────────────────────────────────────────────
+def get_atm(spot, interval=50):
+lower = math.floor(spot / interval) * interval
+mid = lower + interval / 2
+return lower if spot <= mid else lower + interval # ── Scan folder ──────────────────────────────────────────── def
+    scan_folder(folder): files=sorted(glob.glob(os.path.join(folder, "*_depth_levels.csv" ))) strikes=[] for f in files:
+    m=FILE_RE.match(os.path.basename(f)) if m: strikes.append({ "path" : f, "date" : m.group(1), "strike" :
+    int(m.group(2)), "type" : m.group(3), "expiry" : m.group(4).replace("_", " " ), "label" : f"NIFTY {m.group(2)}
+    {m.group(3)} ({m.group(4).replace('_',' ')})",
+                "key"   : f"{m.group(2)}_{m.group(3)}",
+            })
+    return sorted(strikes, key=lambda x: (x["strike"], x["type"]))
+
+# ── Load & pivot ───────────────────────────────────────────
+def load_and_pivot(path):
+    df = pd.read_csv(path, on_bad_lines="skip")
+    df["ts"] = pd.to_datetime(
+        df["received_at_ist"].str.replace(" IST", "", regex=False), errors="coerce"
+    )
+    df = df.dropna(subset=["ts"])
+    df["time_str"] = df["ts"].dt.strftime("%H:%M:%S")
+    snapshots = []
+    for _, group in df.groupby("feed_timestamp_ms", sort=True):
+        g = group.set_index("level")
+        snapshots.append({
+            "ts"     : group["time_str"].iloc[0],
+            "ltp"    : float(group["last_traded_price"].iloc[0]),
+            "bid_qty": [int(g.loc[l, "bid_quantity"]) if l in g.index else 0 for l in range(1, 31)],
+            "bid_px" : [float(g.loc[l, "bid_price"])  if l in g.index else 0 for l in range(1, 31)],
+            "ask_qty": [int(g.loc[l, "ask_quantity"]) if l in g.index else 0 for l in range(1, 31)],
+            "ask_px" : [float(g.loc[l, "ask_price"])  if l in g.index else 0 for l in range(1, 31)],
+        })
+    return snapshots
+
+# ── Fill simulation — returns BOTH slippage types ──────────
+def fill_per_level(snap, side, qty, levels):
+    """
+    Walk the specified levels (sorted).
+    Returns:
+      - weighted_slip : avg_fill_price - L1_price  (true cost impact)
+      - sweep_slip    : last_fill_price - L1_price  (how deep book was swept)
+    """
+    prices = snap["ask_px"] if side == "buy" else snap["bid_px"]
+    qtys   = snap["ask_qty"] if side == "buy" else snap["bid_qty"]
+    ref    = prices[0] if prices else 0
+
+    remaining   = qty
+    cost        = 0.0
+    min_depth   = None
+    last_px     = ref
+    breakdown   = []
+
+    for l in sorted(levels):
+        if remaining <= 0:
+            break
+        idx  = l - 1
+        px   = prices[idx] if idx < len(prices) else 0
+        q    = qtys[idx]   if idx < len(qtys)   else 0
+        take = min(remaining, q)
+        if take > 0:
+            cost    += px * take
+            last_px  = px
+        remaining -= take
+        breakdown.append({
+            "level"    : l,
+            "price"    : round(px, 2),
+            "avail_qty": int(q),
+            "taken_qty": int(take),
+        })
+        if remaining <= 0 and min_depth is None:
+            min_depth = l
+
+    fill_qty  = qty - remaining
+    avg_price = round(cost / fill_qty, 4) if fill_qty > 0 else 0
+
+    # Weighted slippage: avg fill price vs L1
+    weighted_slip = round(avg_price - ref, 4) if side == "buy" else round(ref - avg_price, 4)
+
+    # Sweep slippage: last touched price vs L1
+    sweep_slip = round(last_px - ref, 4) if side == "buy" else round(ref - last_px, 4)
+
+    return {
+        "fill_qty"    : int(fill_qty),
+        "unfilled"    : int(remaining),
+        "filled"      : remaining <= 0,
+        "avg_price"   : avg_price,
+        "ref_price"   : round(ref, 4),
+        "last_px"     : round(last_px, 4),
+        "weighted_slip": weighted_slip,
+        "sweep_slip"  : sweep_slip,
+        "min_depth"   : min_depth,
+        "breakdown"   : breakdown,
+    }
+
+# ── IQR aggregation (replaces simple avg/min/max) ──────────
+def iqr_stats(arr):
+    """
+    Returns median, IQR, outlier fences, plus legacy avg/min/max.
+    Outlier fence: Q1 - 1.5*IQR  to  Q3 + 1.5*IQR
+    """
+    a = [x for x in arr if x is not None and not math.isnan(x)]
+    if not a:
+        return {
+            "avg": None, "min": None, "max": None,
+            "median": None, "q1": None, "q3": None,
+            "iqr": None, "fence_lo": None, "fence_hi": None,
+            "outlier_pct": None,
+        }
+    q1  = float(np.percentile(a, 25))
+    med = float(np.percentile(a, 50))
+    q3  = float(np.percentile(a, 75))
+    iqr = q3 - q1
+    fence_lo = q1 - 1.5 * iqr
+    fence_hi = q3 + 1.5 * iqr
+    outliers = [x for x in a if x < fence_lo or x > fence_hi]
+    return {
+        "avg"        : round(float(np.mean(a)), 4),
+        "min"        : round(float(np.min(a)),  4),
+        "max"        : round(float(np.max(a)),  4),
+        "median"     : round(med, 4),
+        "q1"         : round(q1,  4),
+        "q3"         : round(q3,  4),
+        "iqr"        : round(iqr, 4),
+        "fence_lo"   : round(fence_lo, 4),
+        "fence_hi"   : round(fence_hi, 4),
+        "outlier_pct": round(len(outliers) / len(a) * 100, 1),
+    }
+
+# ── Analyze one strike ─────────────────────────────────────
+def analyze(path, lot_size=LOT_SIZE, order_lots=ORDER_LOTS):
+    print(f"  Loading {os.path.basename(path)} ...")
+    snapshots = load_and_pivot(path)
+    total     = len(snapshots)
+    sampled   = snapshots[::DOWNSAMPLE]
+    order_qty = order_lots * lot_size
+
+    ts_labels   = []
+    ltp_series  = []
+    spread_series = []
+
+    per_level = {
+        "buy" : {d: {"qty": [], "fill_qty": [], "w_slip": [], "s_slip": [], "avg_px": []} for d in KEY_DEPTHS},
+        "sell": {d: {"qty": [], "fill_qty": [], "w_slip": [], "s_slip": [], "avg_px": []} for d in KEY_DEPTHS},
+    }
+    cum_bid = {d: [] for d in KEY_DEPTHS}
+    cum_ask = {d: [] for d in KEY_DEPTHS}
+
+    min_depth_buy_series  = []
+    min_depth_sell_series = []
+    compact_snaps = []
+
+    for snap in sampled:
+        ts  = snap["ts"]
+        ltp = snap["ltp"]
+        ts_labels.append(ts)
+        ltp_series.append(ltp)
+        spread = round(snap["ask_px"][0] - snap["bid_px"][0], 4)
+        spread_series.append(spread)
+
+        compact_snaps.append({
+            "ts"    : ts,
+            "ltp"   : ltp,
+            "bp"    : [round(p, 2) for p in snap["bid_px"]],
+            "bq"    : snap["bid_qty"],
+            "ap"    : [round(p, 2) for p in snap["ask_px"]],
+            "aq"    : snap["ask_qty"],
+            "spread": spread,
+        })
+
+        for d in KEY_DEPTHS:
+            bid_q = sum(snap["bid_qty"][:d])
+            ask_q = sum(snap["ask_qty"][:d])
+            cum_bid[d].append(round(bid_q / lot_size, 2))
+            cum_ask[d].append(round(ask_q / lot_size, 2))
+
+            for side in ["buy", "sell"]:
+                res = fill_per_level(snap, side, order_qty, list(range(1, d+1)))
+                per_level[side][d]["qty"].append(
+                    round((ask_q if side == "buy" else bid_q) / lot_size, 2)
+                )
+                per_level[side][d]["fill_qty"].append(round(res["fill_qty"] / lot_size, 2))
+                per_level[side][d]["w_slip"].append(res["weighted_slip"])
+                per_level[side][d]["s_slip"].append(res["sweep_slip"])
+                per_level[side][d]["avg_px"].append(res["avg_price"])
+
+        bf30 = fill_per_level(snap, "buy",  order_qty, list(range(1, 31)))
+        sf30 = fill_per_level(snap, "sell", order_qty, list(range(1, 31)))
+        min_depth_buy_series.append(bf30["min_depth"])
+        min_depth_sell_series.append(sf30["min_depth"])
+
+    # ── All-day IQR aggregates per depth ──
+    allday = {"buy": {}, "sell": {}}
+    for side in ["buy", "sell"]:
+        for d in KEY_DEPTHS:
+            allday[side][str(d)] = {
+                "qty"   : iqr_stats(per_level[side][d]["qty"]),
+                "fill"  : iqr_stats(per_level[side][d]["fill_qty"]),
+                "w_slip": iqr_stats(per_level[side][d]["w_slip"]),
+                "s_slip": iqr_stats(per_level[side][d]["s_slip"]),
+            }
+
+    allday["min_depth_buy"]  = iqr_stats([x for x in min_depth_buy_series  if x])
+    allday["min_depth_sell"] = iqr_stats([x for x in min_depth_sell_series if x])
+    allday["spread"]         = iqr_stats(spread_series)
+
+    # ── Latest snapshot slippage curve ──
+    latest = snapshots[-1]
+    bid_depth_slip = [round(latest["bid_px"][0] - latest["bid_px"][i], 4) for i in range(30)]
+    ask_depth_slip = [round(latest["ask_px"][i] - latest["ask_px"][0], 4) for i in range(30)]
+
+    s = allday["spread"]
+    summary = {
+        "total_snapshots"  : total,
+        "sampled_snapshots": len(sampled),
+        "time_start"       : ts_labels[0]  if ts_labels else "",
+        "time_end"         : ts_labels[-1] if ts_labels else "",
+        "ltp_latest"       : latest["ltp"],
+        "spread_median"    : s["median"],
+        "spread_q1"        : s["q1"],
+        "spread_q3"        : s["q3"],
+        "spread_iqr"       : s["iqr"],
+        "spread_fence_hi"  : s["fence_hi"],
+        "spread_outlier_pct": s["outlier_pct"],
+        "spread_avg"       : s["avg"],
+        "spread_min"       : s["min"],
+        "spread_max"       : s["max"],
+        "lot_size"         : lot_size,
+        "default_lots"     : order_lots,
+        "default_qty"      : order_qty,
+        "ltp_min"          : round(float(min(ltp_series)), 2) if ltp_series else 0,
+        "ltp_max"          : round(float(max(ltp_series)), 2) if ltp_series else 0,
+        "ltp_avg"          : round(float(np.mean(ltp_series)), 2) if ltp_series else 0,
+    }
+
+    return {
+        "summary"           : summary,
+        "key_depths"        : KEY_DEPTHS,
+        "allday"            : allday,
+        "snapshots"         : compact_snaps,
+        "ts_labels"         : ts_labels,
+        "ltp_series"        : ltp_series,
+        "spread_series"     : spread_series,
+        "cum_bid"           : {str(k): v for k, v in cum_bid.items()},
+        "cum_ask"           : {str(k): v for k, v in cum_ask.items()},
+        "per_level_buy"     : {str(d): per_level["buy"][d]  for d in KEY_DEPTHS},
+        "per_level_sell"    : {str(d): per_level["sell"][d] for d in KEY_DEPTHS},
+        "min_depth_buy"     : min_depth_buy_series,
+        "min_depth_sell"    : min_depth_sell_series,
+        "bid_depth_slip"    : bid_depth_slip,
+        "ask_depth_slip"    : ask_depth_slip,
+    }
+
+# ── Main ───────────────────────────────────────────────────
+def run_analysis():
+    print(f"Scanning {FOLDER} ...")
+    strikes = scan_folder(FOLDER)
+    if not strikes:
+        print("No depth CSV files found."); return
+
+    print(f"Found {len(strikes)} files:")
+    for s in strikes: print(f"  {s[' label']}") results={} for s in strikes: try: data=analyze(s["path"], LOT_SIZE,
+    ORDER_LOTS) data["meta"]=s results[s["key"]]=data except Exception as e: print(f" Skipping {s['label']}: {e}")
+    output={"strikes": strikes, "results" : results, "lot_size" : LOT_SIZE, "default_lots" : ORDER_LOTS} with
+    open(OUTPUT_JSON, "w" ) as f: json.dump(output, f) print(f"\nDone → {OUTPUT_JSON} ({len(strikes)} strikes)") # ──
+    HTML Dashboard ───────────────────────────────────────── HTML=r"""<!DOCTYPE html>
+    <html lang="en">
+
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1">
+        <title>Depth Analyzer v2</title>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+        <style>
+            :root {
+                --bg: #0b0f14;
+                --card: #111820;
+                --card2: #161d26;
+                --border: #1e2830;
+                --text: #dce8f0;
+                --muted: #5a7080;
+                --muted2: #3a5060;
+                --green: #2ecc71;
+                --red: #e74c3c;
+                --blue: #3498db;
+                --orange: #e67e22;
+                --purple: #9b59b6;
+                --yellow: #f1c40f;
+                --teal: #1abc9c;
+                --pink: #e91e8c;
+                --green-dim: rgba(46, 204, 113, .12);
+                --red-dim: rgba(231, 76, 60, .12);
+                --blue-dim: rgba(52, 152, 219, .12);
+                --yellow-dim: rgba(241, 196, 15, .12);
+            }
+
+            * {
+                box-sizing: border-box;
+                margin: 0;
+                padding: 0;
+            }
+
+            body {
+                background: var(--bg);
+                color: var(--text);
+                font-family: 'SF Mono', 'Fira Code', monospace;
+                font-size: 13px;
+                line-height: 1.5;
+            }
+
+            /* ── Header ── */
+            .hdr {
+                padding: 10px 24px;
+                border-bottom: 1px solid var(--border);
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                flex-wrap: wrap;
+                gap: 8px;
+                background: var(--card);
+            }
+
+            .hdr-title {
+                font-size: 13px;
+                font-weight: 700;
+                letter-spacing: 2px;
+                text-transform: uppercase;
+                color: var(--blue);
+            }
+
+            .hdr-meta {
+                color: var(--muted);
+                font-size: 11px;
+                letter-spacing: .5px;
+            }
+
+            /* ── Layout ── */
+            .wrap {
+                max-width: 1600px;
+                margin: 0 auto;
+                padding: 16px 24px;
+            }
+
+            /* ── Controls ── */
+            .ctrl-bar {
+                background: var(--card);
+                border: 1px solid var(--border);
+                border-radius: 6px;
+                padding: 12px 16px;
+                margin-bottom: 14px;
+                display: flex;
+                flex-wrap: wrap;
+                gap: 12px;
+                align-items: flex-end;
+            }
+
+            .cg {
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+            }
+
+            .cg label {
+                font-size: 9px;
+                color: var(--muted);
+                text-transform: uppercase;
+                letter-spacing: 1px;
+            }
+
+            .cg input,
+            .cg select {
+                background: var(--bg);
+                border: 1px solid var(--border);
+                color: var(--text);
+                border-radius: 4px;
+                padding: 5px 9px;
+                font-size: 12px;
+                font-family: inherit;
+                outline: none;
+            }
+
+            .cg input:focus,
+            .cg select:focus {
+                border-color: var(--blue);
+            }
+
+            .atm-pill {
+                display: inline-block;
+                padding: 2px 8px;
+                background: rgba(241, 196, 15, .1);
+                color: var(--yellow);
+                border-radius: 3px;
+                font-size: 11px;
+                letter-spacing: .5px;
+                margin-top: 2px;
+            }
+
+            .tg {
+                display: flex;
+            }
+
+            .tb {
+                padding: 5px 14px;
+                border: 1px solid var(--border);
+                background: transparent;
+                color: var(--muted);
+                cursor: pointer;
+                font-size: 12px;
+                font-family: inherit;
+                transition: all .12s;
+            }
+
+            .tb:first-child {
+                border-radius: 4px 0 0 4px;
+            }
+
+            .tb:last-child {
+                border-radius: 0 4px 4px 0;
+            }
+
+            .tb.buy.on {
+                background: var(--green-dim);
+                color: var(--green);
+                border-color: var(--green);
+            }
+
+            .tb.sell.on {
+                background: var(--red-dim);
+                color: var(--red);
+                border-color: var(--red);
+            }
+
+            .dpills {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 3px;
+            }
+
+            .dpill {
+                padding: 3px 7px;
+                border-radius: 3px;
+                border: 1px solid var(--border);
+                background: transparent;
+                color: var(--muted);
+                cursor: pointer;
+                font-size: 11px;
+                font-family: inherit;
+                transition: all .1s;
+            }
+
+            .dpill.on {
+                background: var(--blue-dim);
+                color: var(--blue);
+                border-color: var(--blue);
+            }
+
+            .apply-btn {
+                padding: 5px 16px;
+                background: var(--blue);
+                border: none;
+                color: #fff;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 12px;
+                font-family: inherit;
+                font-weight: 700;
+                letter-spacing: .5px;
+            }
+
+            .apply-btn:hover {
+                opacity: .85;
+            }
+
+            .snap-lbl {
+                font-size: 10px;
+                color: var(--muted);
+                margin-top: 2px;
+            }
+
+            /* ── IQR Banner — the new hero block ── */
+            .iqr-banner {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 1px;
+                background: var(--border);
+                border: 1px solid var(--border);
+                border-radius: 6px;
+                overflow: hidden;
+                margin-bottom: 14px;
+            }
+
+            .iqr-cell {
+                background: var(--card);
+                padding: 14px 18px;
+            }
+
+            .iqr-lbl {
+                font-size: 9px;
+                color: var(--muted);
+                text-transform: uppercase;
+                letter-spacing: 1px;
+                margin-bottom: 8px;
+            }
+
+            .iqr-main {
+                font-size: 22px;
+                font-weight: 700;
+                letter-spacing: -1px;
+                margin-bottom: 4px;
+            }
+
+            .iqr-band {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                margin-bottom: 6px;
+            }
+
+            .iqr-bar-wrap {
+                flex: 1;
+                height: 4px;
+                background: var(--border);
+                border-radius: 2px;
+                position: relative;
+            }
+
+            .iqr-bar-fill {
+                position: absolute;
+                height: 4px;
+                border-radius: 2px;
+                top: 0;
+            }
+
+            .iqr-nums {
+                font-size: 10px;
+                color: var(--muted);
+                display: flex;
+                justify-content: space-between;
+            }
+
+            .iqr-fence {
+                font-size: 10px;
+                color: var(--muted2);
+                margin-top: 4px;
+            }
+
+            .iqr-outlier {
+                display: inline-block;
+                padding: 1px 6px;
+                border-radius: 3px;
+                font-size: 10px;
+                margin-top: 3px;
+            }
+
+            /* ── Slippage comparison block ── */
+            .slip-compare {
+                display: grid;
+                grid-template-columns: 1fr 1px 1fr;
+                gap: 0;
+                background: var(--card);
+                border: 1px solid var(--border);
+                border-radius: 6px;
+                overflow: hidden;
+                margin-bottom: 14px;
+            }
+
+            .slip-pane {
+                padding: 16px 20px;
+            }
+
+            .slip-divider {
+                background: var(--border);
+            }
+
+            .slip-type {
+                font-size: 9px;
+                color: var(--muted);
+                text-transform: uppercase;
+                letter-spacing: 1px;
+                margin-bottom: 4px;
+            }
+
+            .slip-val {
+                font-size: 28px;
+                font-weight: 700;
+                letter-spacing: -1px;
+            }
+
+            .slip-formula {
+                font-size: 10px;
+                color: var(--muted);
+                margin-top: 6px;
+                font-family: inherit;
+            }
+
+            .slip-explain {
+                font-size: 11px;
+                color: var(--muted);
+                margin-top: 8px;
+                line-height: 1.6;
+                border-top: 1px solid var(--border);
+                padding-top: 8px;
+            }
+
+            .slip-iqr-row {
+                margin-top: 10px;
+                display: grid;
+                grid-template-columns: repeat(4, 1fr);
+                gap: 8px;
+            }
+
+            .slip-iqr-stat {
+                background: var(--bg);
+                border-radius: 4px;
+                padding: 7px 9px;
+            }
+
+            .slip-iqr-key {
+                font-size: 9px;
+                color: var(--muted);
+                text-transform: uppercase;
+                letter-spacing: .5px;
+            }
+
+            .slip-iqr-v {
+                font-size: 14px;
+                font-weight: 700;
+                margin-top: 2px;
+            }
+
+            /* ── Summary cards ── */
+            .scards {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+                gap: 8px;
+                margin-bottom: 14px;
+            }
+
+            .scard {
+                background: var(--card);
+                border: 1px solid var(--border);
+                border-radius: 6px;
+                padding: 10px 13px;
+            }
+
+            .scard .lbl {
+                font-size: 9px;
+                color: var(--muted);
+                text-transform: uppercase;
+                letter-spacing: .8px;
+                margin-bottom: 4px;
+            }
+
+            .scard .val {
+                font-size: 18px;
+                font-weight: 700;
+                letter-spacing: -0.5px;
+            }
+
+            .scard .sub {
+                font-size: 9px;
+                color: var(--muted);
+                margin-top: 2px;
+            }
+
+            .green {
+                color: var(--green);
+            }
+
+            .red {
+                color: var(--red);
+            }
+
+            .blue {
+                color: var(--blue);
+            }
+
+            .orange {
+                color: var(--orange);
+            }
+
+            .purple {
+                color: var(--purple);
+            }
+
+            .yellow {
+                color: var(--yellow);
+            }
+
+            .teal {
+                color: var(--teal);
+            }
+
+            .pink {
+                color: var(--pink);
+            }
+
+            /* ── Section ── */
+            .sec {
+                background: var(--card);
+                border: 1px solid var(--border);
+                border-radius: 6px;
+                padding: 14px 16px;
+                margin-bottom: 14px;
+            }
+
+            .sec h2 {
+                font-size: 9px;
+                color: var(--muted);
+                text-transform: uppercase;
+                letter-spacing: 1px;
+                margin-bottom: 10px;
+            }
+
+            .two {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 12px;
+                margin-bottom: 14px;
+            }
+
+            .chart-wrap {
+                position: relative;
+            }
+
+            .h200 {
+                height: 200px;
+            }
+
+            .h160 {
+                height: 160px;
+            }
+
+            .h240 {
+                height: 240px;
+            }
+
+            /* ── IQR spread chart annotation ── */
+            .spread-legend {
+                display: flex;
+                gap: 12px;
+                flex-wrap: wrap;
+                margin-bottom: 6px;
+            }
+
+            .sl-item {
+                display: flex;
+                align-items: center;
+                gap: 5px;
+                font-size: 10px;
+                color: var(--muted);
+            }
+
+            .sl-dot {
+                width: 8px;
+                height: 8px;
+                border-radius: 2px;
+            }
+
+            /* ── Ladder ── */
+            .ladder-wrap {
+                overflow-x: auto;
+            }
+
+            .ladder {
+                display: grid;
+                grid-template-columns: 1fr 90px 36px 90px 1fr;
+                font-size: 11px;
+                min-width: 420px;
+            }
+
+            .lhdr {
+                color: var(--muted);
+                font-size: 9px;
+                text-transform: uppercase;
+                letter-spacing: .8px;
+                padding: 4px 6px;
+                border-bottom: 1px solid var(--border);
+                background: var(--bg);
+            }
+
+            .lhdr.r {
+                text-align: right;
+            }
+
+            .lhdr.l {
+                text-align: left;
+            }
+
+            .lrow-bb {
+                text-align: right;
+                padding: 3px 6px;
+                border-bottom: 1px solid rgba(30, 40, 48, .5);
+                color: var(--green);
+            }
+
+            .lrow-bp {
+                text-align: right;
+                font-weight: 700;
+                color: var(--green);
+                padding: 3px 6px;
+                border-bottom: 1px solid rgba(30, 40, 48, .5);
+            }
+
+            .lrow-lv {
+                text-align: center;
+                color: var(--muted);
+                background: var(--bg);
+                padding: 3px 6px;
+                border-bottom: 1px solid rgba(30, 40, 48, .5);
+                font-size: 9px;
+            }
+
+            .lrow-ap {
+                text-align: left;
+                font-weight: 700;
+                color: var(--red);
+                padding: 3px 6px;
+                border-bottom: 1px solid rgba(30, 40, 48, .5);
+            }
+
+            .lrow-ab {
+                padding: 3px 6px;
+                border-bottom: 1px solid rgba(30, 40, 48, .5);
+                color: var(--red);
+            }
+
+            /* ── Fill simulation ── */
+            .fstats {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px;
+                margin-bottom: 10px;
+            }
+
+            .fst {
+                background: var(--bg);
+                border-radius: 4px;
+                padding: 8px 12px;
+                flex: 1;
+                min-width: 100px;
+            }
+
+            .fst .fl {
+                font-size: 9px;
+                color: var(--muted);
+                text-transform: uppercase;
+                letter-spacing: .5px;
+            }
+
+            .fst .fv {
+                font-size: 16px;
+                font-weight: 700;
+                margin-top: 2px;
+            }
+
+            .ftable {
+                width: 100%;
+                border-collapse: collapse;
+                font-size: 11px;
+            }
+
+            .ftable th {
+                color: var(--muted);
+                font-size: 9px;
+                text-transform: uppercase;
+                padding: 4px 8px;
+                border-bottom: 1px solid var(--border);
+                text-align: left;
+                letter-spacing: .5px;
+            }
+
+            .ftable td {
+                padding: 4px 8px;
+                border-bottom: 1px solid rgba(30, 40, 48, .5);
+            }
+
+            .no-data {
+                text-align: center;
+                padding: 80px;
+                color: var(--muted);
+            }
+
+            .no-data code {
+                color: var(--blue);
+            }
+
+            /* ── IQR tooltip ── */
+            .iqr-tooltip {
+                position: relative;
+                display: inline-block;
+                cursor: help;
+                border-bottom: 1px dashed var(--muted2);
+            }
+
+            .iqr-tooltip .tip {
+                display: none;
+                position: absolute;
+                bottom: 120%;
+                left: 50%;
+                transform: translateX(-50%);
+                background: #1e2830;
+                border: 1px solid var(--border);
+                border-radius: 4px;
+                padding: 6px 10px;
+                font-size: 10px;
+                color: var(--text);
+                white-space: nowrap;
+                z-index: 100;
+            }
+
+            .iqr-tooltip:hover .tip {
+                display: block;
+            }
+        </style>
+    </head>
+
+    <body>
+        <div class="hdr">
+            <div>
+                <div class="hdr-title">NIFTY Depth Analyzer <span style="color:var(--muted)">v2</span></div>
+                <div class="hdr-meta" id="hdr-sub">loading…</div>
+            </div>
+            <div class="hdr-meta" id="hdr-time"></div>
+        </div>
+        <div class="wrap">
+            <div id="no-data" class="no-data" style="display:none">Run <code>python depth_analyzer_v2.py</code> first,
+                then reload.</div>
+            <div id="app" style="display:none">
+
+                <!-- Controls -->
+                <div class="ctrl-bar">
+                    <div class="cg">
+                        <label>Spot Price</label>
+                        <input type="number" id="inp-spot" placeholder="e.g. 24275" style="width:110px"
+                            oninput="onSpot()">
+                        <div class="atm-pill" id="atm-badge" style="visibility:hidden">ATM —</div>
+                    </div>
+                    <div class="cg">
+                        <label>Time HH:MM:SS</label>
+                        <input type="text" id="inp-time" placeholder="e.g. 10:15:00" style="width:105px"
+                            oninput="onTime()">
+                        <div class="snap-lbl" id="snap-info">showing: latest</div>
+                    </div>
+                    <div class="cg">
+                        <label>Strike</label>
+                        <select id="strike-sel" style="width:240px" onchange="onStrike()"></select>
+                    </div>
+                    <div class="cg">
+                        <label>Side</label>
+                        <div class="tg">
+                            <button class="tb buy on" id="btn-buy" onclick="setSide('buy')">Buy</button>
+                            <button class="tb sell" id="btn-sell" onclick="setSide('sell')">Sell</button>
+                        </div>
+                    </div>
+                    <div class="cg">
+                        <label>Lots</label>
+                        <input type="number" id="inp-lots" value="100" min="1" style="width:70px" oninput="onLots()">
+                        <div class="snap-lbl" id="qty-disp">= 6500 qty</div>
+                    </div>
+                    <div class="cg">
+                        <label>Depth Levels</label>
+                        <div class="dpills" id="depth-pills"></div>
+                    </div>
+                    <div class="cg"><label>&nbsp;</label><button class="apply-btn" onclick="applyAll()">APPLY</button>
+                    </div>
+                </div>
+
+                <!-- Slippage comparison — the star of the show -->
+                <div class="slip-compare" id="slip-compare"></div>
+
+                <!-- IQR Banner -->
+                <div class="iqr-banner" id="iqr-banner"></div>
+
+                <!-- Summary cards -->
+                <div class="scards" id="scards"></div>
+
+                <!-- LTP + Spread -->
+                <div class="two">
+                    <div class="sec">
+                        <h2>LTP over time</h2>
+                        <div class="chart-wrap h200"><canvas id="ltpChart" role="img"
+                                aria-label="LTP line chart over time"></canvas></div>
+                    </div>
+                    <div class="sec">
+                        <h2>Bid-ask spread — with IQR bands</h2>
+                        <div class="spread-legend" id="spread-legend"></div>
+                        <div class="chart-wrap h200"><canvas id="spreadChart" role="img"
+                                aria-label="Spread over time with IQR bands"></canvas></div>
+                    </div>
+                </div>
+
+                <!-- Ladder -->
+                <div class="sec">
+                    <h2 id="ladder-title">Order book ladder — selected levels (lots)</h2>
+                    <div class="ladder-wrap">
+                        <div class="ladder" id="ladder">
+                            <div class="lhdr r">Bid Lots</div>
+                            <div class="lhdr r">Bid Price</div>
+                            <div class="lhdr" style="text-align:center">Lvl</div>
+                            <div class="lhdr l">Ask Price</div>
+                            <div class="lhdr l">Ask Lots</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Fill sim -->
+                <div class="sec">
+                    <h2 id="fill-title">Fill simulation</h2>
+                    <div class="fstats" id="fill-stats"></div>
+                    <table class="ftable">
+                        <thead>
+                            <tr>
+                                <th>Level</th>
+                                <th>Price</th>
+                                <th>Avail (Lots)</th>
+                                <th>Taken (Lots)</th>
+                                <th>Running Fill (Lots)</th>
+                            </tr>
+                        </thead>
+                        <tbody id="fill-tbody"></tbody>
+                    </table>
+                </div>
+
+                <!-- Slippage depth curve -->
+                <div class="sec">
+                    <h2>Price slippage vs L1 — per level (latest snapshot)</h2>
+                    <div class="chart-wrap h160"><canvas id="slipChart" role="img"
+                            aria-label="Slippage per depth level"></canvas></div>
+                </div>
+
+                <!-- Slippage over time — both types -->
+                <div class="two">
+                    <div class="sec">
+                        <h2>Weighted slippage over time</h2>
+                        <div class="chart-wrap h200"><canvas id="wSlipChart" role="img"
+                                aria-label="Weighted slippage series"></canvas></div>
+                    </div>
+                    <div class="sec">
+                        <h2>Sweep slippage over time</h2>
+                        <div class="chart-wrap h200"><canvas id="sSlipChart" role="img"
+                                aria-label="Sweep slippage series"></canvas></div>
+                    </div>
+                </div>
+
+                <!-- Depth qty -->
+                <div class="two">
+                    <div class="sec">
+                        <h2 id="bidqty-t">Bid qty over time (lots)</h2>
+                        <div class="chart-wrap h200"><canvas id="bidQtyChart" role="img" aria-label="Bid qty"></canvas>
+                        </div>
+                    </div>
+                    <div class="sec">
+                        <h2 id="askqty-t">Ask qty over time (lots)</h2>
+                        <div class="chart-wrap h200"><canvas id="askQtyChart" role="img" aria-label="Ask qty"></canvas>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Min depth -->
+                <div class="sec">
+                    <h2>Min depth to fill order — over time</h2>
+                    <div class="chart-wrap h160"><canvas id="minDepthChart" role="img"
+                            aria-label="Min depth to fill"></canvas></div>
+                </div>
+
+            </div>
+        </div>
+
+        <script>
+            let D = null, CUR = null, side = 'buy', lots = 100, lotSize = 65, snapIdx = -1;
+            let selLvls = [1, 2, 3, 4, 5];
+            let charts = {};
+
+            fetch('depth_results.json')
+                .then(r => { if (!r.ok) throw 0; return r.json(); })
+                .then(d => { D = d; init(); })
+                .catch(() => document.getElementById('no-data').style.display = 'block');
+
+            function init() {
+                document.getElementById('app').style.display = 'block';
+                lotSize = D.lot_size; lots = D.default_lots;
+                document.getElementById('inp-lots').value = lots;
+                document.getElementById('qty-disp').textContent = `= ${lots * lotSize} qty`;
+                const sel = document.getElementById('strike-sel');
+                D.strikes.forEach(s => {
+                    const o = document.createElement('option');
+                    o.value = s.key; o.textContent = s.label; sel.appendChild(o);
+                });
+                const kd = (D.results[Object.keys(D.results)[0]]?.key_depths) || [1, 2, 3, 4, 5, 10, 15, 20, 30];
+                selLvls = kd.slice(0, 5);
+                const pills = document.getElementById('depth-pills');
+                kd.forEach(l => {
+                    const b = document.createElement('button');
+                    b.className = 'dpill' + (selLvls.includes(l) ? ' on' : '');
+                    b.textContent = l; b.dataset.l = l;
+                    b.onclick = () => {
+                        const i = selLvls.indexOf(l);
+                        if (i >= 0) selLvls.splice(i, 1); else selLvls.push(l);
+                        selLvls.sort((a, b) => a - b);
+                        b.classList.toggle('on');
+                    };
+                    pills.appendChild(b);
+                });
+                onStrike();
+            }
+
+            function getATM(s, iv = 50) { const lo = Math.floor(s / iv) * iv, mid = lo + iv / 2; return s <= mid ? lo : lo + iv; }
+            function onSpot() {
+                const s = parseFloat(document.getElementById('inp-spot').value); if (isNaN(s)) return;
+                const atm = getATM(s);
+                const badge = document.getElementById('atm-badge');
+                badge.style.visibility = 'visible'; badge.textContent = `ATM: ${atm}`;
+                const m = D.strikes.find(x => x.key === `${atm}_CE`) || D.strikes.find(x => x.key === `${atm}_PE`);
+                if (m) { document.getElementById('strike-sel').value = m.key; onStrike(); }
+            }
+            function onTime() {
+                const t = document.getElementById('inp-time').value.trim();
+                const info = document.getElementById('snap-info');
+                if (!CUR || !t) { snapIdx = -1; info.textContent = 'showing: latest'; renderAll(); return; }
+                const idx = CUR.ts_labels.findIndex(ts => ts >= t);
+                snapIdx = idx === -1 ? CUR.ts_labels.length - 1 : idx;
+                info.textContent = `@ ${CUR.ts_labels[snapIdx]}`;
+                renderAll();
+            }
+            function onStrike() {
+                const key = document.getElementById('strike-sel').value;
+                CUR = D.results[key]; if (!CUR) return;
+                document.getElementById('hdr-sub').textContent = CUR.meta.label;
+                document.getElementById('hdr-time').textContent =
+                    `${CUR.summary.time_start} → ${CUR.summary.time_end}  |  ${CUR.summary.total_snapshots} snapshots`;
+                const t = document.getElementById('inp-time').value.trim();
+                if (t) onTime(); else { snapIdx = -1; renderAll(); }
+            }
+            function onLots() {
+                lots = parseInt(document.getElementById('inp-lots').value) || 1;
+                document.getElementById('qty-disp').textContent = `= ${lots * lotSize} qty`;
+            }
+            function setSide(s) {
+                side = s;
+                document.getElementById('btn-buy').classList.toggle('on', s === 'buy');
+                document.getElementById('btn-sell').classList.toggle('on', s === 'sell');
+                renderAll();
+            }
+            function applyAll() { onLots(); renderAll(); }
+
+            function getSnap() {
+                if (!CUR) return null;
+                return snapIdx === -1 ? CUR.snapshots[CUR.snapshots.length - 1] : CUR.snapshots[snapIdx] || CUR.snapshots[CUR.snapshots.length - 1];
+            }
+            function snapTime() { return snapIdx === -1 ? 'latest' : CUR.ts_labels[snapIdx] || 'latest'; }
+
+            // ── Live fill from current snapshot ──
+            function liveF(snap) {
+                const isBuy = side === 'buy';
+                const prices = isBuy ? snap.ap : snap.bp, qtys = isBuy ? snap.aq : snap.bq;
+                const ref = prices[0] || 0;
+                const qty = lots * lotSize;
+                let rem = qty, cost = 0, lastPx = ref, minD = null;
+                for (const l of selLvls) {
+                    if (rem <= 0) break;
+                    const px = prices[l - 1] || 0, q = qtys[l - 1] || 0, take = Math.min(rem, q);
+                    if (take > 0) { cost += px * take; lastPx = px; }
+                    rem -= take;
+                    if (rem <= 0 && minD === null) minD = l;
+                }
+                const fillQty = qty - rem;
+                const avgPx = fillQty > 0 ? cost / fillQty : 0;
+                const wSlip = isBuy ? (avgPx - ref) : (ref - avgPx);
+                const sSlip = isBuy ? (lastPx - ref) : (ref - lastPx);
+                return { fillQty, rem, avgPx, ref, wSlip, sSlip, minD, lastPx };
+            }
+
+            function fmt(v, dp = 3) { return v != null ? v.toFixed(dp) : '—'; }
+            function fmtSign(v, dp = 3) { if (v == null) return '—'; return (v >= 0 ? '+' : '') + v.toFixed(dp); }
+            function colorC(v, inv = false) {
+                if (v == null) return 'var(--muted)';
+                const pos = v > 0; return (pos !== inv) ? 'var(--red)' : 'var(--green)';
+            }
+
+            // ── Slippage comparison block ──────────────────────────────
+            function renderSlipCompare() {
+                const snap = getSnap(); const hasSnap = snapIdx !== -1;
+                const maxD = Math.max(...selLvls); const dKey = String(maxD);
+                const isBuy = side === 'buy';
+
+                let wSlip, sSlip, wIQR, sIQR;
+                if (hasSnap) {
+                    const f = liveF(snap);
+                    wSlip = f.wSlip; sSlip = f.sSlip;
+                    // IQR from allday for context
+                    const ad = CUR.allday[side][dKey] || {};
+                    wIQR = ad.w_slip; sIQR = ad.s_slip;
+                } else {
+                    const ad = CUR.allday[side][dKey] || {};
+                    wIQR = ad.w_slip || {}; sIQR = ad.s_slip || {};
+                    wSlip = wIQR.median; sSlip = sIQR.median;
+                }
+
+                const label = hasSnap ? `@ ${snapTime()}` : `median (all day)`;
+
+                document.getElementById('slip-compare').innerHTML = `
+    <div class="slip-pane">
+      <div class="slip-type">Weighted avg slippage</div>
+      <div class="slip-val" style="color:${colorC(wSlip)}">${fmtSign(wSlip, 3)}</div>
+      <div class="slip-formula">= avg_fill_price − L1_price &nbsp;|&nbsp; ${label}</div>
+      <div class="slip-explain">True cost impact. The weighted average price you paid across all levels, minus the best available L1 price. This is what hits your P&amp;L.</div>
+      <div class="slip-iqr-row">
+        <div class="slip-iqr-stat"><div class="slip-iqr-key">Day median</div><div class="slip-iqr-v" style="color:${colorC(wIQR?.median)}">${fmt(wIQR?.median)}</div></div>
+        <div class="slip-iqr-stat"><div class="slip-iqr-key">Q1</div><div class="slip-iqr-v">${fmt(wIQR?.q1)}</div></div>
+        <div class="slip-iqr-stat"><div class="slip-iqr-key">Q3</div><div class="slip-iqr-v">${fmt(wIQR?.q3)}</div></div>
+        <div class="slip-iqr-stat"><div class="slip-iqr-key">IQR</div><div class="slip-iqr-v blue">${fmt(wIQR?.iqr)}</div></div>
+      </div>
+    </div>
+    <div class="slip-divider"></div>
+    <div class="slip-pane">
+      <div class="slip-type">Sweep slippage</div>
+      <div class="slip-val" style="color:${colorC(sSlip)}">${fmtSign(sSlip, 3)}</div>
+      <div class="slip-formula">= last_fill_price − L1_price &nbsp;|&nbsp; ${label}</div>
+      <div class="slip-explain">Book depth signal. How far into the order book your order swept — the worst price you touched. Higher = thinner book at your order size.</div>
+      <div class="slip-iqr-row">
+        <div class="slip-iqr-stat"><div class="slip-iqr-key">Day median</div><div class="slip-iqr-v" style="color:${colorC(sIQR?.median)}">${fmt(sIQR?.median)}</div></div>
+        <div class="slip-iqr-stat"><div class="slip-iqr-key">Q1</div><div class="slip-iqr-v">${fmt(sIQR?.q1)}</div></div>
+        <div class="slip-iqr-stat"><div class="slip-iqr-key">Q3</div><div class="slip-iqr-v">${fmt(sIQR?.q3)}</div></div>
+        <div class="slip-iqr-stat"><div class="slip-iqr-key">IQR</div><div class="slip-iqr-v blue">${fmt(sIQR?.iqr)}</div></div>
+      </div>
+    </div>`;
+            }
+
+            // ── IQR Banner ─────────────────────────────────────────────
+            function renderIQRBanner() {
+                const maxD = Math.max(...selLvls); const dKey = String(maxD);
+                const isBuy = side === 'buy';
+                const ad = CUR.allday[side][dKey] || {};
+                const sp = CUR.allday.spread || {};
+                const md = isBuy ? CUR.allday.min_depth_buy : CUR.allday.min_depth_sell;
+
+                function iqrCell(lbl, stats, color, unit = '', inv = false) {
+                    if (!stats || stats.median == null) return `<div class="iqr-cell"><div class="iqr-lbl">${lbl}</div><div class="iqr-main" style="color:var(--muted)">N/A</div></div>`;
+                    const r = stats.q3 - stats.q1; const range = stats.max - stats.min || 1;
+                    const q1pct = ((stats.q1 - stats.min) / range * 100).toFixed(1);
+                    const widpct = (r / range * 100).toFixed(1);
+                    const opct = stats.outlier_pct || 0;
+                    return `<div class="iqr-cell">
+      <div class="iqr-lbl">${lbl}</div>
+      <div class="iqr-main" style="color:${color}">${stats.median.toFixed(3)}${unit}</div>
+      <div class="iqr-band">
+        <span style="font-size:10px;color:var(--muted)">${stats.q1.toFixed(3)}</span>
+        <div class="iqr-bar-wrap">
+          <div class="iqr-bar-fill" style="left:${q1pct}%;width:${widpct}%;background:${color};opacity:.5"></div>
+        </div>
+        <span style="font-size:10px;color:var(--muted)">${stats.q3.toFixed(3)}</span>
+      </div>
+      <div class="iqr-nums"><span>min ${stats.min.toFixed(3)}</span><span>IQR ${stats.iqr.toFixed(3)}</span><span>max ${stats.max.toFixed(3)}</span></div>
+      <div class="iqr-fence">fence hi: ${stats.fence_hi.toFixed(3)}</div>
+      <span class="iqr-outlier" style="background:${opct > 5 ? 'rgba(231,76,60,.15)' : 'rgba(46,204,113,.1)'};color:${opct > 5 ? 'var(--red)' : 'var(--green)'}">${opct}% outliers</span>
+    </div>`;
+                }
+
+                document.getElementById('iqr-banner').innerHTML =
+                    iqrCell(`Spread (all day)`, sp, 'var(--yellow)', '') +
+                    iqrCell(`Weighted slip @ L${maxD}`, ad.w_slip, 'var(--red)') +
+                    iqrCell(`Sweep slip @ L${maxD}`, ad.s_slip, 'var(--orange)') +
+                    iqrCell(`Fill qty @ L${maxD} (lots)`, ad.fill, 'var(--blue)') +
+                    iqrCell(`Min depth (${CUR.summary.default_lots}L)`, md, 'var(--purple)');
+            }
+
+            // ── Summary cards ──────────────────────────────────────────
+            function renderSummary() {
+                const s = CUR.summary, snap = getSnap(), hasSnap = snapIdx !== -1;
+                const maxD = Math.max(...selLvls);
+                const f = liveF(snap);
+                const cards = [
+                    { lbl: 'LTP', val: `₹${hasSnap ? snap.ltp.toFixed(2) : s.ltp_latest}`, sub: hasSnap ? snapTime() : 'latest', cls: 'blue' },
+                    { lbl: 'Spread', val: `₹${hasSnap ? snap.spread.toFixed(3) : s.spread_median?.toFixed(3) ?? '—'}`, sub: hasSnap ? '@ snap' : 'median', cls: 'yellow' },
+                    { lbl: 'Spread IQR', val: `₹${s.spread_iqr?.toFixed(3) ?? '—'}`, sub: `Q1–Q3 band`, cls: 'teal' },
+                    { lbl: `Fill @ L${maxD}`, val: `${(f.fillQty / lotSize).toFixed(1)}L`, sub: `of ${lots} lots`, cls: f.fillQty >= lots * lotSize ? 'green' : 'red' },
+                    { lbl: 'Weighted slip', val: fmtSign(f.wSlip, 3), sub: 'avg fill vs L1', cls: f.wSlip > 0 ? 'red' : 'green' },
+                    { lbl: 'Sweep slip', val: fmtSign(f.sSlip, 3), sub: 'last fill vs L1', cls: f.sSlip > 0 ? 'orange' : 'green' },
+                    { lbl: 'Min Depth', val: f.minD ? `L${f.minD}` : 'N/A', sub: `to fill ${lots}L`, cls: f.minD ? 'purple' : 'red' },
+                ];
+                document.getElementById('scards').innerHTML = cards.map(c => `
+    <div class="scard"><div class="lbl">${c.lbl}</div><div class="val ${c.cls}">${c.val}</div><div class="sub">${c.sub}</div></div>`).join('');
+            }
+
+            // ── Ladder ─────────────────────────────────────────────────
+            function renderLadder() {
+                const snap = getSnap();
+                document.getElementById('ladder-title').textContent = `Order book ladder @ ${snapTime()} — selected levels (lots)`;
+                const maxBQ = Math.max(...selLvls.map(l => snap.bq[l - 1] || 0));
+                const maxAQ = Math.max(...selLvls.map(l => snap.aq[l - 1] || 0));
+                const ldr = document.getElementById('ladder');
+                ldr.querySelectorAll('.lrow').forEach(r => r.remove());
+                selLvls.forEach(l => {
+                    const bq = snap.bq[l - 1] || 0, bp = snap.bp[l - 1] || 0, aq = snap.aq[l - 1] || 0, ap = snap.ap[l - 1] || 0;
+                    const bP = maxBQ > 0 ? (bq / maxBQ * 100).toFixed(0) : 0, aP = maxAQ > 0 ? (aq / maxAQ * 100).toFixed(0) : 0;
+                    const mkCell = (cls, txt, bg) => {
+                        const d = document.createElement('div');
+                        d.className = cls + ' lrow'; d.textContent = txt;
+                        if (bg) d.style.cssText = bg; return d;
+                    };
+                    ldr.appendChild(mkCell('lrow-bb', `${(bq / lotSize).toFixed(1)}`, `background:linear-gradient(to left,rgba(46,204,113,.15) ${bP}%,transparent ${bP}%)`));
+                    ldr.appendChild(mkCell('lrow-bp', `₹${bp.toFixed(2)}`));
+                    ldr.appendChild(mkCell('lrow-lv', `${l}`));
+                    ldr.appendChild(mkCell('lrow-ap', `₹${ap.toFixed(2)}`));
+                    ldr.appendChild(mkCell('lrow-ab', `${(aq / lotSize).toFixed(1)}`, `background:linear-gradient(to right,rgba(231,76,60,.15) ${aP}%,transparent ${aP}%)`));
+                });
+            }
+
+            // ── Fill sim ───────────────────────────────────────────────
+            function renderFillSim() {
+                const snap = getSnap(), isBuy = side === 'buy', qty = lots * lotSize;
+                const prices = isBuy ? snap.ap : snap.bp, qtys = isBuy ? snap.aq : snap.bq;
+                const ref = prices[0] || 0;
+                let rem = qty, cost = 0, lastPx = ref, runFill = 0;
+                const rows = [];
+                for (const l of selLvls) {
+                    if (rem <= 0) break;
+                    const px = prices[l - 1] || 0, q = qtys[l - 1] || 0, take = Math.min(rem, q);
+                    if (take > 0) { cost += px * take; lastPx = px; }
+                    rem -= take; runFill += take;
+                    rows.push({ l, px, q, take, runFill });
+                }
+                const fillQty = qty - rem, avgPx = fillQty > 0 ? cost / fillQty : 0;
+                const wSlip = isBuy ? (avgPx - ref) : (ref - avgPx);
+                const sSlip = isBuy ? (lastPx - ref) : (ref - lastPx);
+                document.getElementById('fill-title').textContent =
+                    `Fill simulation @ ${snapTime()} — ${side.toUpperCase()}, ${lots} lots, depth [${selLvls.join(',')}]`;
+                document.getElementById('fill-stats').innerHTML = `
+    <div class="fst"><div class="fl">Fill</div><div class="fv ${rem <= 0 ? 'green' : 'orange'}">${(fillQty / lotSize).toFixed(1)} lots</div></div>
+    <div class="fst"><div class="fl">Unfilled</div><div class="fv ${rem > 0 ? 'red' : 'green'}">${(rem / lotSize).toFixed(1)} lots</div></div>
+    <div class="fst"><div class="fl">Avg Fill Price</div><div class="fv blue">₹${avgPx.toFixed(3)}</div></div>
+    <div class="fst"><div class="fl">L1 Ref</div><div class="fv">₹${ref.toFixed(2)}</div></div>
+    <div class="fst"><div class="fl">Weighted Slip</div><div class="fv" style="color:${colorC(wSlip)}">${fmtSign(wSlip, 3)}</div></div>
+    <div class="fst"><div class="fl">Sweep Slip</div><div class="fv" style="color:${colorC(sSlip)}">${fmtSign(sSlip, 3)}</div></div>`;
+                document.getElementById('fill-tbody').innerHTML = rows.map(r => `<tr>
+    <td>${r.l}</td><td>₹${r.px.toFixed(2)}</td>
+    <td>${(r.q / lotSize).toFixed(1)}</td>
+    <td style="color:${isBuy ? 'var(--red)' : 'var(--green)'}">${(r.take / lotSize).toFixed(1)}</td>
+    <td>${(r.runFill / lotSize).toFixed(1)}</td></tr>`).join('');
+            }
+
+            // ── Charts ─────────────────────────────────────────────────
+            const CO = () => ({
+                responsive: true, maintainAspectRatio: false,
+                plugins: { legend: { display: false } },
+                scales: {
+                    x: { ticks: { color: '#3a5060', font: { size: 9 }, maxRotation: 45, autoSkip: true, maxTicksLimit: 16 }, grid: { color: '#111820' }, border: { display: false } },
+                    y: { ticks: { color: '#3a5060', font: { size: 9 } }, grid: { color: '#111820' }, border: { display: false } }
+                }
+            });
+            function mk(id, type, labels, datasets, extra = {}) {
+                if (charts[id]) { charts[id].destroy(); delete charts[id]; }
+                const opts = CO(); Object.assign(opts, extra);
+                charts[id] = new Chart(document.getElementById(id).getContext('2d'), { type, data: { labels, datasets }, options: opts });
+            }
+
+            function renderLTP() {
+                const ds = [{ label: 'LTP', data: CUR.ltp_series, borderColor: '#3498db', backgroundColor: 'rgba(52,152,219,.05)', pointRadius: 0, tension: 0.3, fill: true, borderWidth: 1.5 }];
+                if (snapIdx >= 0 && snapIdx < CUR.ltp_series.length) {
+                    const m = new Array(CUR.ltp_series.length).fill(null); m[snapIdx] = CUR.ltp_series[snapIdx];
+                    ds.push({ label: 'Selected', data: m, borderColor: '#f1c40f', backgroundColor: '#f1c40f', pointRadius: 6, showLine: false });
+                }
+                mk('ltpChart', 'line', CUR.ts_labels, ds);
+            }
+
+            function renderSpread() {
+                const sp = CUR.allday.spread || {};
+                const medianLine = CUR.ts_labels.map(() => sp.median || null);
+                const q1Line = CUR.ts_labels.map(() => sp.q1 || null);
+                const q3Line = CUR.ts_labels.map(() => sp.q3 || null);
+                const fhLine = CUR.ts_labels.map(() => sp.fence_hi || null);
+                const ds = [
+                    { label: 'Spread', data: CUR.spread_series, borderColor: '#f1c40f', backgroundColor: 'rgba(241,196,15,.08)', pointRadius: 0, tension: 0.2, fill: false, borderWidth: 1 },
+                    { label: 'Median', data: medianLine, borderColor: '#2ecc71', borderDash: [6, 3], pointRadius: 0, borderWidth: 1, fill: false },
+                    { label: 'Q1', data: q1Line, borderColor: '#1abc9c', borderDash: [3, 4], pointRadius: 0, borderWidth: 1, fill: false },
+                    { label: 'Q3', data: q3Line, borderColor: '#e67e22', borderDash: [3, 4], pointRadius: 0, borderWidth: 1, fill: false },
+                    { label: 'Outlier fence', data: fhLine, borderColor: '#e74c3c', borderDash: [4, 6], pointRadius: 0, borderWidth: 1, fill: false },
+                ];
+                mk('spreadChart', 'line', CUR.ts_labels, ds);
+                document.getElementById('spread-legend').innerHTML =
+                    [{ c: '#f1c40f', l: 'Spread' }, { c: '#2ecc71', l: 'Median' }, { c: '#1abc9c', l: 'Q1' }, { c: '#e67e22', l: 'Q3' }, { c: '#e74c3c', l: 'Outlier fence' }]
+                        .map(x => `<span class="sl-item"><span class="sl-dot" style="background:${x.c}"></span>${x.l}</span>`).join('');
+            }
+
+            function renderSlipDepth() {
+                const src = side === 'buy' ? CUR.ask_depth_slip : CUR.bid_depth_slip; if (!src) return;
+                const colors = selLvls.map(l => {
+                    const v = src[l - 1] || 0;
+                    return v > 0.1 ? 'rgba(231,76,60,.7)' : v > 0.02 ? 'rgba(230,126,34,.7)' : 'rgba(46,204,113,.5)';
+                });
+                mk('slipChart', 'bar', selLvls.map(l => `L${l}`), [{
+                    label: 'Slip vs L1', data: selLvls.map(l => src[l - 1] || 0),
+                    backgroundColor: colors, borderWidth: 0, borderRadius: 3
+                }]);
+            }
+
+            function renderSlipOverTime() {
+                const pl = side === 'buy' ? CUR.per_level_buy : CUR.per_level_sell;
+                const colors = ['#3498db', '#e74c3c', '#2ecc71', '#e67e22', '#9b59b6'];
+                const wDS = selLvls.map((l, i) => ({ label: `L${l}`, data: pl[String(l)]?.w_slip || [], borderColor: colors[i % 5], pointRadius: 0, tension: 0.2, borderWidth: 1.5 }));
+                const sDS = selLvls.map((l, i) => ({ label: `L${l}`, data: pl[String(l)]?.s_slip || [], borderColor: colors[i % 5], pointRadius: 0, tension: 0.2, borderWidth: 1.5, borderDash: [4, 3] }));
+                mk('wSlipChart', 'line', CUR.ts_labels, wDS);
+                mk('sSlipChart', 'line', CUR.ts_labels, sDS);
+            }
+
+            function renderDepthQty() {
+                const colors = ['#2ecc71', '#3498db', '#f1c40f', '#9b59b6', '#e67e22'];
+                const bDS = selLvls.map((l, i) => ({ label: `L${l}`, data: CUR.cum_bid[String(l)] || [], borderColor: colors[i % 5], pointRadius: 0, tension: 0.2, borderWidth: 1.5 }));
+                const aDS = selLvls.map((l, i) => ({ label: `L${l}`, data: CUR.cum_ask[String(l)] || [], borderColor: colors[i % 5], pointRadius: 0, tension: 0.2, borderWidth: 1.5 }));
+                mk('bidQtyChart', 'line', CUR.ts_labels, bDS);
+                mk('askQtyChart', 'line', CUR.ts_labels, aDS);
+            }
+
+            function renderMinDepth() {
+                mk('minDepthChart', 'line', CUR.ts_labels, [
+                    { label: 'Buy', data: CUR.min_depth_buy, borderColor: '#e74c3c', pointRadius: 0, tension: 0.2, borderWidth: 1.5 },
+                    { label: 'Sell', data: CUR.min_depth_sell, borderColor: '#2ecc71', pointRadius: 0, tension: 0.2, borderWidth: 1.5 }
+                ]);
+            }
+
+            function renderAll() {
+                if (!CUR) return;
+                renderSlipCompare();
+                renderIQRBanner();
+                renderSummary();
+                renderLadder();
+                renderFillSim();
+                renderLTP();
+                renderSpread();
+                renderSlipDepth();
+                renderSlipOverTime();
+                renderDepthQty();
+                renderMinDepth();
+            }
+        </script>
+    </body>
+
+    </html>"""
+
+    # ── Serve ──────────────────────────────────────────────────
+    class ThreadedHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True
+
+    def serve_and_open():
+    os.chdir(SCRIPT_DIR)
+    class Q(http.server.SimpleHTTPRequestHandler):
+    def log_message(self,*a): pass
+    def handle_error(self,*a): pass
+    with ThreadedHTTPServer(("", PORT), Q) as s:
+    url = f"http://localhost:{PORT}/depth_dashboard.html"
+    print(f"\n Dashboard → {url}")
+    print(" Press Ctrl+C to stop\n")
+    threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    s.serve_forever()
+
+    if __name__ == "__main__":
+    run_analysis()
+    with open(OUTPUT_HTML, "w") as f: f.write(HTML)
+    print(f" Dashboard written → {OUTPUT_HTML}")
+    serve_and_open()
