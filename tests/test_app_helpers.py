@@ -1,7 +1,12 @@
 from pathlib import Path
 import zipfile
 
-from tickdash.app_helpers import kaggle_dataset_download_url, materialize_downloaded_file, materialize_uploaded_csv
+from tickdash.app_helpers import (
+    kaggle_auth,
+    kaggle_dataset_download_url,
+    materialize_downloaded_file,
+    materialize_uploaded_csv,
+)
 
 
 def test_materialize_uploaded_csv_writes_stable_temp_file(tmp_path):
@@ -30,6 +35,19 @@ def test_kaggle_dataset_download_url_leaves_api_url_unchanged():
     url = "https://www.kaggle.com/api/v1/datasets/download/danish2op/bidaskdashboard"
 
     assert kaggle_dataset_download_url(url) == url
+
+
+def test_kaggle_auth_returns_basic_auth_tuple_only_for_kaggle_urls():
+    env = {"KAGGLE_USERNAME": "alice", "KAGGLE_KEY": "secret"}
+
+    assert kaggle_auth("https://www.kaggle.com/api/v1/datasets/download/a/b", env) == ("alice", "secret")
+    assert kaggle_auth("https://example.test/file.csv", env) is None
+
+
+def test_kaggle_auth_ignores_incomplete_credentials():
+    env = {"KAGGLE_USERNAME": "alice"}
+
+    assert kaggle_auth("https://www.kaggle.com/api/v1/datasets/download/a/b", env) is None
 
 
 def test_materialize_downloaded_file_extracts_first_csv_from_zip(tmp_path):

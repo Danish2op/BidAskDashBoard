@@ -6,6 +6,15 @@ from urllib.parse import urlparse
 import zipfile
 
 
+def kaggle_auth(url: str, env: dict[str, str]) -> tuple[str, str] | None:
+    parsed = urlparse(url.strip())
+    username = env.get("KAGGLE_USERNAME", "").strip()
+    key = env.get("KAGGLE_KEY", "").strip()
+    if parsed.netloc == "www.kaggle.com" and username and key:
+        return username, key
+    return None
+
+
 def materialize_uploaded_csv(filename: str, raw_bytes: bytes, cache_dir: Path) -> Path:
     cache_dir.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256(raw_bytes).hexdigest()[:16]

@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from tickdash.analyzer import KEY_DEPTHS, analyze_snapshots
-from tickdash.app_helpers import kaggle_dataset_download_url, materialize_downloaded_file, materialize_uploaded_csv
+from tickdash.app_helpers import kaggle_auth, kaggle_dataset_download_url, materialize_downloaded_file, materialize_uploaded_csv
 from tickdash.csv_loader import list_instrument_keys, load_snapshots_with_count
 from tickdash.metadata_refresh import merge_metadata_rows
 from tickdash.metadata_store import open_metadata_store
@@ -199,7 +199,7 @@ def cached_snapshots(csv_path: str, instrument_key: str, downsample: int) -> tup
 @st.cache_data(show_spinner=True)
 def cached_public_csv_url(public_url: str) -> str:
     download_url = kaggle_dataset_download_url(public_url)
-    response = requests.get(download_url, timeout=180)
+    response = requests.get(download_url, timeout=180, auth=kaggle_auth(download_url, os.environ))
     response.raise_for_status()
     path = materialize_downloaded_file(
         download_url,
