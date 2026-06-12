@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.io as pio
+import requests
 import streamlit as st
 from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from tickdash.analyzer import KEY_DEPTHS, analyze_snapshots
+from tickdash.app_helpers import kaggle_dataset_download_url, materialize_downloaded_file, materialize_uploaded_csv
 from tickdash.csv_loader import list_instrument_keys, load_snapshots_with_count
 from tickdash.metadata_refresh import merge_metadata_rows
 from tickdash.metadata_store import open_metadata_store
@@ -193,6 +196,19 @@ def cached_snapshots(csv_path: str, instrument_key: str, downsample: int) -> tup
     return load_snapshots_with_count(csv_path, instrument_key, downsample=downsample)
 
 
+@st.cache_data(show_spinner=True)
+def cached_public_csv_url(public_url: str) -> str:
+    download_url = kaggle_dataset_download_url(public_url)
+    response = requests.get(download_url, timeout=180)
+    response.raise_for_status()
+    path = materialize_downloaded_file(
+        download_url,
+        response.content,
+        Path(tempfile.gettempdir()) / "tickdashboard_downloads",
+    )
+    return str(path)
+
+
 def refresh_metadata(keys: set[str]) -> dict[str, dict]:
     service_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
     sheet_id = os.getenv("METADATA_SHEET_ID", "")
@@ -299,11 +315,35 @@ st.title("NIFTY Depth Analyzer v2")
 st.caption("Order-book depth, slippage, and fill simulation from local tick CSV with expiry-safe metadata")
 
 with st.sidebar:
-    csv_path = st.text_input("Market tick CSV path", DEFAULT_CSV_PATH)
-    path_ok = Path(csv_path).exists()
-    if not path_ok:
-        st.error("CSV path not found.")
-        st.stop()
+    source_mode = st.radio("Data source", ["Public URL", "Local path", "Upload CSV"], horizontal=False)
+    csv_path = ""
+    if source_mode == "Public URL":
+        public_url = st.text_input("Public CSV / Kaggle dataset URL", "")
+        if not public_url.strip():
+            st.info("Paste public CSV URL or Kaggle dataset URL.")
+            st.stop()
+        try:
+            csv_path = cached_public_csv_url(public_url.strip())
+        except Exception:
+            st.error("Could not download CSV. Use a direct public CSV URL or Kaggle dataset URL.")
+            st.stop()
+    elif source_mode == "Local path":
+        csv_path = st.text_input("Market tick CSV path", DEFAULT_CSV_PATH)
+        if not Path(csv_path).exists():
+            st.error("CSV path not found.")
+            st.stop()
+    else:
+        uploaded_csv = st.file_uploader("Upload market tick CSV", type=["csv"])
+        if uploaded_csv is None:
+            st.info("Upload CSV to run hosted dashboard.")
+            st.stop()
+        csv_path = str(
+            materialize_uploaded_csv(
+                uploaded_csv.name,
+                uploaded_csv.getvalue(),
+                Path(tempfile.gettempdir()) / "tickdashboard_uploads",
+            )
+        )
 
     with st.spinner("Reading instruments..."):
         keys = cached_instrument_keys(csv_path)
