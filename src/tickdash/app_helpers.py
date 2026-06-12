@@ -41,8 +41,9 @@ def materialize_downloaded_file(url: str, raw_bytes: bytes, cache_dir: Path) -> 
     cache_dir.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256((url + str(len(raw_bytes))).encode("utf-8") + raw_bytes[:1024]).hexdigest()[:16]
     suffix = Path(urlparse(url).path).suffix.lower() or ".csv"
+    is_zip = suffix == ".zip" or raw_bytes.startswith(b"PK\x03\x04")
 
-    if suffix == ".zip":
+    if is_zip:
         zip_path = cache_dir / f"download_{digest}.zip"
         if not zip_path.exists():
             zip_path.write_bytes(raw_bytes)

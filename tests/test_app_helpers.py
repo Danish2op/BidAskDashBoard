@@ -62,6 +62,17 @@ def test_materialize_downloaded_file_extracts_first_csv_from_zip(tmp_path):
     assert csv_path.read_text() == "a,b\n1,2\n"
 
 
+def test_materialize_downloaded_file_extracts_zip_bytes_without_zip_suffix(tmp_path):
+    zip_path = tmp_path / "dataset.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("market_ticks.csv", "a,b\n1,2\n")
+
+    csv_path = materialize_downloaded_file("https://www.kaggle.com/api/v1/datasets/download/a/b", zip_path.read_bytes(), tmp_path)
+
+    assert csv_path.name.endswith(".csv")
+    assert csv_path.read_text() == "a,b\n1,2\n"
+
+
 def test_materialize_downloaded_file_stores_csv_bytes(tmp_path):
     csv_path = materialize_downloaded_file("https://example.test/market_ticks.csv", b"a,b\n1,2\n", tmp_path)
 
